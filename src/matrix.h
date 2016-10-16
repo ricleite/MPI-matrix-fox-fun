@@ -9,13 +9,21 @@ struct Matrix
 
 typedef struct Matrix Matrix;
 
-void Matrix_Init(Matrix* m, int n);
+void Matrix_Init(Matrix* m);
+void Matrix_Create(Matrix* m, int n);
 void Matrix_Delete(Matrix* m);
-int Matrix_GetValue(Matrix* m, int i, int j);
+int Matrix_GetValue(Matrix const* m, int i, int j);
 void Matrix_SetValue(Matrix* m, int i, int j, int value);
-int Matrix_Compare(Matrix* m1, Matrix* m2);
+int Matrix_Compare(Matrix const* m1, Matrix const* m2);
+void Matrix_Split(Matrix const* m, int* slice_ptr, int slice_size);
 
-inline void Matrix_Init(Matrix* m, int n)
+inline void Matrix_Init(Matrix* m)
+{
+    m->n = 0;
+    m->mat = NULL;
+}
+
+inline void Matrix_Create(Matrix* m, int n)
 {
     assert(m);
     assert(n > 0);
@@ -26,11 +34,13 @@ inline void Matrix_Init(Matrix* m, int n)
 
 inline void Matrix_Delete(Matrix* m)
 {
-    free(m->mat);
+    if (m->mat)
+        free(m->mat);
+
     m->mat = NULL;
 }
 
-inline int Matrix_GetValue(Matrix* m, int i, int j)
+inline int Matrix_GetValue(Matrix const* m, int i, int j)
 {
     assert(m);
     assert(m->mat);
@@ -46,7 +56,7 @@ inline void Matrix_SetValue(Matrix* m, int i, int j, int value)
     m->mat[(m->n * i) + j] = value;
 }
 
-inline int Matrix_Compare(Matrix* m1, Matrix* m2)
+inline int Matrix_Compare(Matrix const* m1, Matrix const* m2)
 {
     assert(m1 && m2);
     assert(m1->mat && m2->mat);
@@ -65,4 +75,34 @@ inline int Matrix_Compare(Matrix* m1, Matrix* m2)
     }
 
     return 0;
+}
+
+// split matrix[n][n] into ordered slice[slice_size][slice_size] pieces
+void Matrix_Split(Matrix const* m, int* slice_ptr, int slice_size)
+{
+    assert(m);
+    assert(m->mat);
+    assert(slice_ptr);
+    assert(m->n % slice_size == 0);
+
+    int const slices_per_line = m->n / slice_size;
+
+    for (int i = 0; i < m->n; ++i)
+    {
+        for (int j = 0; j < m->n; ++j)
+        {
+            // slice number in the matrix
+            int slice_num = (i / slice_size) * slices_per_line + (j / slice_size);
+            // calc coords inside slice
+            int slice_i = i % slice_size;
+            int slice_j = j % slice_size;
+
+            int idx = slice_num * (slice_size * slice_size);
+            // add local slice coords
+            idx += (slice_i * slice_size) + slice_j;
+
+            int value = Matrix_GetValue(m, i, j);
+            slice_ptr[idx] = value;
+        }
+    }
 }
