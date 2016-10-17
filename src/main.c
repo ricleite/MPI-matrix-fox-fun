@@ -35,7 +35,7 @@ int main(int argc, char** argv)
 
     // MPI_Finalize has to be always called, so wrap error checks/functionality
     int exit_code = main_impl(argc, argv, num_tasks, world_rank);
-    if (exit_code && world_rank == RANK_MASTER)
+    if (exit_code > 1 && world_rank == RANK_MASTER)
         print_usage();
 
     MPI_Finalize();
@@ -97,7 +97,34 @@ int main_impl(int argc, char** argv, int num_tasks, int world_rank)
                 }
             }
 
-            // @todo: program options
+            // process program options
+            if (master_exit_code == 0)
+            {
+                for (int i = 2; i < argc; ++i)
+                {
+                    char* arg = argv[i];
+                    if (strcmp(arg, "--test") == 0)
+                    {
+                        ++i;
+                        if (i >= argc)
+                        {
+                            LOG_ERROR("Missing test_file arg");
+                            master_exit_code = 2;
+                            break;
+                        }
+
+                        test_file_str = argv[i];
+                    }
+                    else if (strcmp(arg, "--no-matrix-output") == 0)
+                        matrix_output = 0;
+                    else
+                    {
+                        LOG_ERROR("Invalid arg '%s'", arg);
+                        master_exit_code = 2;
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -149,9 +176,9 @@ int main_impl(int argc, char** argv, int num_tasks, int world_rank)
             {
                 master_exit_code = Matrix_Compare(&master_m, &test);
                 if (master_exit_code == 0)
-                    printf("Passed test\n");
+                    printf("Passed test for matrix size %d\n", master_m.n);
                 else
-                    printf("Failed test!\n");
+                    printf("Failed test for matrix size %d\n", master_m.n);
             }
         }
     }
