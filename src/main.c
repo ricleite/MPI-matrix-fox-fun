@@ -12,11 +12,17 @@
 #error "Compile with at least C99 (-std=c99)"
 #endif
 
+#define MATRIX_INFINITY 200000
+
 void print_usage();
 int main_impl(int argc, char** argv, int num_tasks, int world_rank);
 int read_matrix(char* file_str, Matrix* m);
+void compute_matrix(Matrix* master_m, Matrix* m, int world_rank,
+    MPI_Comm grid_comm, MPI_Comm row_comm, MPI_Comm col_comm);
 void scatter_matrix_to_slaves(Matrix const* master_m, Matrix* m, int world_rank);
 void gather_matrix_from_slaves(Matrix* master_m, Matrix* m, int world_rank);
+void convert_matrix(Matrix* m, int for_output);
+void print_matrix(Matrix const* m);
 
 int main(int argc, char** argv)
 {
@@ -41,6 +47,7 @@ void print_usage()
     printf("Usage: ./main.out matrix_file [options]\n");
     printf("Options:\n");
     printf("'--test test_file' uses matrix in test_file to compare with output matrix, exit error 1 if not equal\n");
+    printf("'--no-matrix-output' silences default matrix print output\n");
     printf("'--help' prints this usage message\n");
 }
 
@@ -55,13 +62,17 @@ int main_impl(int argc, char** argv, int num_tasks, int world_rank)
     Matrix_Init(&master_m);
     Matrix_Init(&m);
 
+    char* test_file_str = NULL;
+    int matrix_output = 2;
+
     // master has to:
+    // - process program options
     // - do error checking, notify slaves to exit early if error
     // - read the entire matrix file and distribute it
     if (world_rank == RANK_MASTER)
     {
         if (argc <= 1) // missing matrix file arg
-            master_exit_code = 1;
+            master_exit_code = 2;
         else
         {
             char* in_file_str = argv[1];
@@ -77,7 +88,7 @@ int main_impl(int argc, char** argv, int num_tasks, int world_rank)
                 {
                     LOG_ERROR("Bad slave count (%d), can't split matrix (size %d)",
                         num_tasks, master_m.n);
-                    master_exit_code = 1;
+                    master_exit_code = 2;
                 }
                 else
                 {
@@ -85,6 +96,8 @@ int main_impl(int argc, char** argv, int num_tasks, int world_rank)
                     m.n = master_m.n / q;
                 }
             }
+
+            // @todo: program options
         }
     }
 
@@ -101,9 +114,51 @@ int main_impl(int argc, char** argv, int num_tasks, int world_rank)
     // create slave slice for all processes
     Matrix_Create(&m, m.n);
 
-    scatter_matrix_to_slaves(&master_m, &m, world_rank);
+    // setup grid communicators
+    MPI_Comm grid_comm;
+    MPI_Comm row_comm;
+    MPI_Comm col_comm;
 
-    printf("num_tasks %d, world_rank %d\n", num_tasks, world_rank);
+    {
+        int slices_per_line = master_m.n / m.n;
+        int dims[2] = { slices_per_line, slices_per_line };
+        int periods[2] = { 1, 1 };
+        MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, 0, &grid_comm);
+
+        int row_dims[2] = { 0, 1 };
+        MPI_Cart_sub(grid_comm, row_dims, &row_comm);
+
+        int col_dims[2] = { 1, 0 };
+        MPI_Cart_sub(grid_comm, col_dims, &col_comm);
+    }
+
+    compute_matrix(&master_m, &m, world_rank, grid_comm, row_comm, col_comm);
+
+    if (world_rank == RANK_MASTER)
+    {
+        if (matrix_output)
+            print_matrix(&master_m);
+
+        if (test_file_str)
+        {
+            Matrix test;
+            Matrix_Init(&test);
+            if (read_matrix(test_file_str, &test))
+                master_exit_code = 2; // failed to read matrix
+            else
+            {
+                master_exit_code = Matrix_Compare(&master_m, &test);
+                if (master_exit_code == 0)
+                    printf("Passed test\n");
+                else
+                    printf("Failed test!\n");
+            }
+        }
+    }
+
+    MPI_Comm_free(&col_comm);
+    MPI_Comm_free(&row_comm);
+    MPI_Comm_free(&grid_comm);
 
 main_impl_cleanup:
     if (world_rank == RANK_MASTER)
@@ -154,6 +209,96 @@ int read_matrix(char* file_str, Matrix* m)
     return 0;
 }
 
+void compute_matrix(Matrix* master_m, Matrix* m, int world_rank,
+    MPI_Comm grid_comm, MPI_Comm row_comm, MPI_Comm col_comm)
+{
+    // replace 0s by infinite cost, 0 cost between 2 nodes means no link
+    if (world_rank == RANK_MASTER)
+        convert_matrix(master_m, 0);
+
+    // perform Floyd-Warshall to compute shortest paths
+    int const iterations = (int)ceil(log2(master_m->n));
+    int const slice_size = m->n;
+    int const slices_per_line = master_m->n / slice_size;
+
+    assert(pow(2, iterations) > master_m->n);
+
+    int grid_rank;
+    MPI_Comm_rank(grid_comm, &grid_rank);
+
+    int coords[2];
+    MPI_Cart_coords(grid_comm, grid_rank, 2, coords);
+
+    int my_row = coords[0];
+    int my_col = coords[1];
+
+    Matrix temp_a;
+    Matrix temp_b;
+    Matrix temp_c;
+    Matrix_Init(&temp_a);
+    Matrix_Init(&temp_b);
+    Matrix_Init(&temp_c);
+    Matrix_Create(&temp_a, slice_size);
+    Matrix_Create(&temp_b, slice_size);
+    Matrix_Create(&temp_c, slice_size);
+
+    // need to run log(n) matrix multiplications for Floyd-Warshall algorithm
+    for (int itr = 0; itr < iterations; ++itr)
+    {
+        scatter_matrix_to_slaves(master_m, m, world_rank);
+
+        // run Fox's algorithm
+        // A = temp_a, B = temp_b, C = temp_c, original matrix = m
+        memcpy(temp_b.mat, m->mat, (slice_size * slice_size) * sizeof(int));
+        memset(temp_c.mat, MATRIX_INFINITY, (slice_size * slice_size) * sizeof(int));
+
+        for (int stage = 0; stage < slices_per_line; ++stage)
+        {
+            int cast_root = (my_row + stage) % slices_per_line;
+            Matrix* a = (cast_root == my_col) ? m : &temp_a;
+            Matrix* b = &temp_b;
+            Matrix* c = &temp_c;
+
+            MPI_Bcast(a->mat, slice_size * slice_size, MPI_INT, cast_root, row_comm);
+
+            for (int i = 0; i < slice_size; ++i)
+            {
+                for (int j = 0; j < slice_size; ++j)
+                {
+                    int c_value = Matrix_GetValue(c, i, j);
+                    for (int row_col = 0; row_col < slice_size; ++row_col)
+                    {
+                        int a_value = Matrix_GetValue(a, i, row_col);
+                        int b_value = Matrix_GetValue(b, row_col, j);
+
+                        c_value = MIN(c_value, a_value + b_value);
+                    }
+
+                    Matrix_SetValue(c, i, j, c_value);
+                }
+            }
+
+            // dest for our current B
+            int const above_in_col = (slices_per_line + my_row - 1) % slices_per_line;
+            // source of our next B
+            int const below_in_col = (my_row + 1) % slices_per_line;
+
+            MPI_Sendrecv_replace(b->mat, slice_size * slice_size, MPI_INT,
+                above_in_col, 0, below_in_col, 0, col_comm, NULL);
+        }
+
+        gather_matrix_from_slaves(master_m, &temp_c, world_rank);
+    }
+
+    // convert infinite costs back to 0, for output/comparisons
+    if (world_rank == RANK_MASTER)
+        convert_matrix(master_m, 1);
+
+    Matrix_Delete(&temp_a);
+    Matrix_Delete(&temp_b);
+    Matrix_Delete(&temp_c);
+}
+
 void scatter_matrix_to_slaves(Matrix const* master_m, Matrix* m, int world_rank)
 {
     int const matrix_n = master_m->n;
@@ -168,10 +313,8 @@ void scatter_matrix_to_slaves(Matrix const* master_m, Matrix* m, int world_rank)
     }
 
     // scatter matrix slices, each one with size (slice_n * slice_n)
-    MPI_Scatter((void*)slice_ptr, (slice_n * slice_n), MPI_INT,
-        (void*)slice_recv_ptr, (slice_n * slice_n), MPI_INT, RANK_MASTER, MPI_COMM_WORLD);
-
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Scatter(slice_ptr, (slice_n * slice_n), MPI_INT,
+        slice_recv_ptr, (slice_n * slice_n), MPI_INT, RANK_MASTER, MPI_COMM_WORLD);
 
     if (world_rank == RANK_MASTER)
         free(slice_ptr);
@@ -179,5 +322,54 @@ void scatter_matrix_to_slaves(Matrix const* master_m, Matrix* m, int world_rank)
 
 void gather_matrix_from_slaves(Matrix* master_m, Matrix* m, int world_rank)
 {
+    int const matrix_n = master_m->n;
+    int const slice_n = m->n;
 
+    int* slice_ptr = NULL;
+    int* slice_send_ptr = m->mat;
+    if (world_rank == RANK_MASTER)
+        slice_ptr = (int*)malloc(matrix_n * matrix_n * sizeof(int));
+
+    MPI_Gather(slice_send_ptr, (slice_n * slice_n), MPI_INT,
+        slice_ptr, (slice_n * slice_n), MPI_INT, RANK_MASTER, MPI_COMM_WORLD);
+
+    if (world_rank == RANK_MASTER)
+    {
+        Matrix_Join(master_m, slice_ptr, slice_n);
+        free(slice_ptr);
+    }
+}
+
+void convert_matrix(Matrix* m, int for_output)
+{
+    for (int i = 0; i < m->n; ++i)
+    {
+        for (int j = 0; j < m->n; ++j)
+        {
+            if (i == j)
+                continue;
+
+            int value = Matrix_GetValue(m, i, j);
+            if (for_output && value >= MATRIX_INFINITY)
+                Matrix_SetValue(m, i, j, 0);
+            else if (for_output == 0 && value == 0)
+                Matrix_SetValue(m, i, j, MATRIX_INFINITY);
+        }
+    }
+
+
+}
+
+void print_matrix(Matrix const* m)
+{
+    for (int i = 0; i < m->n; ++i)
+    {
+        for (int j = 0; j < m->n; ++j)
+        {
+            int value = Matrix_GetValue(m, i, j);
+            printf("%d ", value);
+        }
+
+        printf("\n");
+    }
 }
